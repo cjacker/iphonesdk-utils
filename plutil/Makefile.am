@@ -3,8 +3,6 @@ bin_PROGRAMS = ios-plutil
 ios_plutil_SOURCES = plutil.c 
 
 ios_plutil_CFLAGS = \
-	$(XML_CFLAGS)		\
-	-I$(top_srcdir)/libplutil
+	$(XML_CFLAGS) $(PLIST_CFLAGS)
 
-ios_plutil_LDADD =	\
-       	$(top_builddir)/libplutil/libplutil.la
+ios_plutil_LDADD = $(PLIST_LIBS) $(XML_LIBS)

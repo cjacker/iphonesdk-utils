@@ -1,9 +1,9 @@
 bin_PROGRAMS = ldid
 ldid_SOURCES = ldid.cpp
 
-ldid_CPPFLAGS = -std=c++0x -I$(top_srcdir)/libhelper $(CRYPTO_CFLAGS)
+ldid_CPPFLAGS = -std=c++0x -I$(top_srcdir)/libhelper $(CRYPTO_CFLAGS) $(PLIST_CFLAGS)
 
-ldid_LDADD          = liblookup2.la $(top_builddir)/libhelper/libhelper.la $(CRYPTO_LIBS)
+ldid_LDADD          = liblookup2.la $(top_builddir)/libhelper/libhelper.la $(CRYPTO_LIBS) $(PLIST_LIBS)
 
 noinst_LTLIBRARIES  = liblookup2.la  
 liblookup2_la_SOURCES  = lookup2.c

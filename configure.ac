@@ -61,6 +61,9 @@ PKG_CHECK_MODULES(CRYPTO, [
     libcrypto 
 ])
 
+PKG_CHECK_MODULES(PLIST, [
+    libplist 
+])
 
 AC_CHECK_PROG(HAVE_LLVM_CONFIG, llvm-config, true, false)
 
