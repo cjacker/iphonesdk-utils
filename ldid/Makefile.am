@@ -1,16 +1,10 @@
 bin_PROGRAMS = ldid
 ldid_SOURCES = \
 	       ldid.cpp	\
-	       lookup2.c	\
-	       sha1.c
+	       lookup2.c
 
-ldid_CPPFLAGS = -I$(top_srcdir)/libhelper
-ldid_LDADD = $(top_builddir)/libhelper/libhelper.la
+ldid_CPPFLAGS = -std=c++0x -I$(top_srcdir)/libhelper
+ldid_LDADD = $(top_builddir)/libhelper/libhelper.la -lcrypto
 
 EXTRA_DIST =	\
-	sha1.h			\
-	minimal/hexdump.h	\
-	minimal/mapping.h	\
-	minimal/sqlite3.h	\
-	minimal/stdlib.h	\
-	minimal/string.h
+	sha1.h

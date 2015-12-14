@@ -1,57 +1,190 @@
-/* JocStrap - Java/Objective-C Bootstrap
- * Copyright (C) 2007  Jay Freeman (saurik)
+/* ldid - (Mach-O) Link-Loader Identity Editor
+ * Copyright (C) 2007-2015  Jay Freeman (saurik)
 */
 
+/* GNU Affero General Public License, Version 3 {{{ */
 /*
- *        Redistribution and use in source and binary
- * forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the
- *    above copyright notice, this list of conditions
- *    and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the
- *    above copyright notice, this list of conditions
- *    and the following disclaimer in the documentation
- *    and/or other materials provided with the
- *    distribution.
- * 3. The name of the author may not be used to endorse
- *    or promote products derived from this software
- *    without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS''
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,
- * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
- * TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
- * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
 
-#include "minimal/stdlib.h"
-#include "minimal/string.h"
-#include "minimal/mapping.h"
-extern "C"
-{
-#include "sha1.h"
-}
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+**/
+/* }}} */
+
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#include <sys/wait.h>
-#include <sys/types.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <regex.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <unistd.h>
+
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
-#include "helper.h"
+#ifndef LDID_NOSMIME
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs7.h>
+#include <openssl/pkcs12.h>
+#endif
 
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#define LDID_SHA1_DIGEST_LENGTH CC_SHA1_DIGEST_LENGTH
+#define LDID_SHA1 CC_SHA1
+#define LDID_SHA1_CTX CC_SHA1_CTX
+#define LDID_SHA1_Init CC_SHA1_Init
+#define LDID_SHA1_Update CC_SHA1_Update
+#define LDID_SHA1_Final CC_SHA1_Final
+#else
+#include <openssl/sha.h>
+#define LDID_SHA1_DIGEST_LENGTH SHA_DIGEST_LENGTH
+#define LDID_SHA1 SHA1
+#define LDID_SHA1_CTX SHA_CTX
+#define LDID_SHA1_Init SHA1_Init
+#define LDID_SHA1_Update SHA1_Update
+#define LDID_SHA1_Final SHA1_Final
+#endif
+
+#ifndef LDID_NOPLIST
+#include <plist/plist.h>
+#endif
+
+#include "ldid.hpp"
+
+#define _assert___(line) \
+    #line
+#define _assert__(line) \
+    _assert___(line)
+
+#ifdef __EXCEPTIONS
+#define _assert_(expr, format, ...) \
+    do if (!(expr)) { \
+        fprintf(stderr, "%s(%u): _assert(): " format "\n", __FILE__, __LINE__, ## __VA_ARGS__); \
+        throw __FILE__ "(" _assert__(__LINE__) "): _assert(" #expr ")"; \
+    } while (false)
+#else
+// XXX: this is not acceptable
+#define _assert_(expr, format, ...) \
+    do if (!(expr)) { \
+        fprintf(stderr, "%s(%u): _assert(): " format "\n", __FILE__, __LINE__, ## __VA_ARGS__); \
+        exit(-1); \
+    } while (false)
+#endif
+
+#define _assert(expr) \
+    _assert_(expr, "%s", #expr)
+
+#define _syscall(expr, ...) [&] { for (;;) { \
+    auto _value(expr); \
+    if ((long) _value != -1) \
+        return _value; \
+    int error(errno); \
+    if (error == EINTR) \
+        continue; \
+    /* XXX: EINTR is included in this list to fix g++ */ \
+    for (auto success : (long[]) {EINTR, __VA_ARGS__}) \
+        if (error == success) \
+            return (decltype(expr)) -success; \
+    _assert_(false, "errno=%u", error); \
+} }()
+
+#define _trace() \
+    fprintf(stderr, "_trace(%s:%u): %s\n", __FILE__, __LINE__, __FUNCTION__)
+
+#define _not(type) \
+    ((type) ~ (type) 0)
+
+#define _packed \
+    __attribute__((packed))
+
+template <typename Type_>
+struct Iterator_ {
+    typedef typename Type_::const_iterator Result;
+};
+
+#define _foreach(item, list) \
+    for (bool _stop(true); _stop; ) \
+        for (const __typeof__(list) &_list = (list); _stop; _stop = false) \
+            for (Iterator_<__typeof__(list)>::Result _item = _list.begin(); _item != _list.end(); ++_item) \
+                for (bool _suck(true); _suck; _suck = false) \
+                    for (const __typeof__(*_item) &item = *_item; _suck; _suck = false)
+
+class _Scope {
+};
+
+template <typename Function_>
+class Scope :
+    public _Scope
+{
+  private:
+    Function_ function_;
+
+  public:
+    Scope(const Function_ &function) :
+        function_(function)
+    {
+    }
+
+    ~Scope() {
+        function_();
+    }
+};
+
+template <typename Function_>
+Scope<Function_> _scope(const Function_ &function) {
+    return Scope<Function_>(function);
+}
+
+#define _scope__(counter, function) \
+    __attribute__((__unused__)) \
+    const _Scope &_scope ## counter(_scope([&]function))
+#define _scope_(counter, function) \
+    _scope__(counter, function)
+#define _scope(function) \
+    _scope_(__COUNTER__, function)
+
+#define CPU_ARCH_MASK  uint32_t(0xff000000)
+#define CPU_ARCH_ABI64 uint32_t(0x01000000)
+
+#define CPU_TYPE_ANY     uint32_t(-1)
+#define CPU_TYPE_VAX     uint32_t( 1)
+#define CPU_TYPE_MC680x0 uint32_t( 6)
+#define CPU_TYPE_X86     uint32_t( 7)
+#define CPU_TYPE_MC98000 uint32_t(10)
+#define CPU_TYPE_HPPA    uint32_t(11)
+#define CPU_TYPE_ARM     uint32_t(12)
+#define CPU_TYPE_MC88000 uint32_t(13)
+#define CPU_TYPE_SPARC   uint32_t(14)
+#define CPU_TYPE_I860    uint32_t(15)
+#define CPU_TYPE_POWERPC uint32_t(18)
+
+#define CPU_TYPE_I386 CPU_TYPE_X86
+
+#define CPU_TYPE_ARM64     (CPU_ARCH_ABI64 | CPU_TYPE_ARM)
+#define CPU_TYPE_POWERPC64 (CPU_ARCH_ABI64 | CPU_TYPE_POWERPC)
+#define CPU_TYPE_X86_64    (CPU_ARCH_ABI64 | CPU_TYPE_X86)
 
 struct fat_header {
     uint32_t magic;
@@ -82,8 +215,12 @@ struct mach_header {
 #define MH_MAGIC 0xfeedface
 #define MH_CIGAM 0xcefaedfe
 
+#define MH_MAGIC_64 0xfeedfacf
+#define MH_CIGAM_64 0xcffaedfe
+
 #define MH_DYLDLINK   0x4
 
+#define MH_OBJECT     0x1
 #define MH_EXECUTE    0x2
 #define MH_DYLIB      0x6
 #define MH_BUNDLE     0x8
@@ -94,14 +231,32 @@ struct load_command {
     uint32_t cmdsize;
 } _packed;
 
-#define LC_REQ_DYLD  0x80000000
+#define LC_REQ_DYLD           uint32_t(0x80000000)
 
-#define	LC_SEGMENT         0x01
-#define LC_LOAD_DYLIB      0x0c
-#define LC_ID_DYLIB        0x0d
-#define LC_UUID            0x1b
-#define LC_CODE_SIGNATURE  0x1d
-#define LC_REEXPORT_DYLIB (0x1f | LC_REQ_DYLD)
+#define LC_SEGMENT            uint32_t(0x01)
+#define LC_SYMTAB             uint32_t(0x02)
+#define LC_DYSYMTAB           uint32_t(0x0b)
+#define LC_LOAD_DYLIB         uint32_t(0x0c)
+#define LC_ID_DYLIB           uint32_t(0x0d)
+#define LC_SEGMENT_64         uint32_t(0x19)
+#define LC_UUID               uint32_t(0x1b)
+#define LC_CODE_SIGNATURE     uint32_t(0x1d)
+#define LC_SEGMENT_SPLIT_INFO uint32_t(0x1e)
+#define LC_REEXPORT_DYLIB     uint32_t(0x1f | LC_REQ_DYLD)
+#define LC_ENCRYPTION_INFO    uint32_t(0x21)
+#define LC_DYLD_INFO          uint32_t(0x22)
+#define LC_DYLD_INFO_ONLY     uint32_t(0x22 | LC_REQ_DYLD)
+#define LC_ENCRYPTION_INFO_64 uint32_t(0x2c)
+
+union Version {
+    struct {
+        uint8_t patch;
+        uint8_t minor;
+        uint16_t major;
+    } _packed;
+
+    uint32_t value;
+};
 
 struct dylib {
     uint32_t name;
@@ -122,6 +277,100 @@ struct uuid_command {
     uint8_t uuid[16];
 } _packed;
 
+struct symtab_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t symoff;
+    uint32_t nsyms;
+    uint32_t stroff;
+    uint32_t strsize;
+} _packed;
+
+struct dyld_info_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t rebase_off;
+    uint32_t rebase_size;
+    uint32_t bind_off;
+    uint32_t bind_size;
+    uint32_t weak_bind_off;
+    uint32_t weak_bind_size;
+    uint32_t lazy_bind_off;
+    uint32_t lazy_bind_size;
+    uint32_t export_off;
+    uint32_t export_size;
+} _packed;
+
+struct dysymtab_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t ilocalsym;
+    uint32_t nlocalsym;
+    uint32_t iextdefsym;
+    uint32_t nextdefsym;
+    uint32_t iundefsym;
+    uint32_t nundefsym;
+    uint32_t tocoff;
+    uint32_t ntoc;
+    uint32_t modtaboff;
+    uint32_t nmodtab;
+    uint32_t extrefsymoff;
+    uint32_t nextrefsyms;
+    uint32_t indirectsymoff;
+    uint32_t nindirectsyms;
+    uint32_t extreloff;
+    uint32_t nextrel;
+    uint32_t locreloff;
+    uint32_t nlocrel;
+} _packed;
+
+struct dylib_table_of_contents {
+    uint32_t symbol_index;
+    uint32_t module_index;
+} _packed;
+
+struct dylib_module {
+    uint32_t module_name;
+    uint32_t iextdefsym;
+    uint32_t nextdefsym;
+    uint32_t irefsym;
+    uint32_t nrefsym;
+    uint32_t ilocalsym;
+    uint32_t nlocalsym;
+    uint32_t iextrel;
+    uint32_t nextrel;
+    uint32_t iinit_iterm;
+    uint32_t ninit_nterm;
+    uint32_t objc_module_info_addr;
+    uint32_t objc_module_info_size;
+} _packed;
+
+struct dylib_reference {
+    uint32_t isym:24;
+    uint32_t flags:8;
+} _packed;
+
+struct relocation_info {
+    int32_t r_address;
+    uint32_t r_symbolnum:24;
+    uint32_t r_pcrel:1;
+    uint32_t r_length:2;
+    uint32_t r_extern:1;
+    uint32_t r_type:4;
+} _packed;
+
+struct nlist {
+    union {
+        char *n_name;
+        int32_t n_strx;
+    } n_un;
+
+    uint8_t n_type;
+    uint8_t n_sect;
+    uint8_t n_desc;
+    uint32_t n_value;
+} _packed;
+
 struct segment_command {
     uint32_t cmd;
     uint32_t cmdsize;
@@ -134,7 +383,21 @@ struct segment_command {
     uint32_t initprot;
     uint32_t nsects;
     uint32_t flags;
-};
+} _packed;
+
+struct segment_command_64 {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    char segname[16];
+    uint64_t vmaddr;
+    uint64_t vmsize;
+    uint64_t fileoff;
+    uint64_t filesize;
+    uint32_t maxprot;
+    uint32_t initprot;
+    uint32_t nsects;
+    uint32_t flags;
+} _packed;
 
 struct section {
     char sectname[16];
@@ -148,7 +411,22 @@ struct section {
     uint32_t flags;
     uint32_t reserved1;
     uint32_t reserved2;
-};
+} _packed;
+
+struct section_64 {
+    char sectname[16];
+    char segname[16];
+    uint64_t addr;
+    uint64_t size;
+    uint32_t offset;
+    uint32_t align;
+    uint32_t reloff;
+    uint32_t nreloc;
+    uint32_t flags;
+    uint32_t reserved1;
+    uint32_t reserved2;
+    uint32_t reserved3;
+} _packed;
 
 struct linkedit_data_command {
     uint32_t cmd;
@@ -157,13 +435,62 @@ struct linkedit_data_command {
     uint32_t datasize;
 } _packed;
 
-uint16_t Swap_(uint16_t value) {
+struct encryption_info_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t cryptoff;
+    uint32_t cryptsize;
+    uint32_t cryptid;
+} _packed;
+
+#define BIND_OPCODE_MASK                             0xf0
+#define BIND_IMMEDIATE_MASK                          0x0f
+#define BIND_OPCODE_DONE                             0x00
+#define BIND_OPCODE_SET_DYLIB_ORDINAL_IMM            0x10
+#define BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB           0x20
+#define BIND_OPCODE_SET_DYLIB_SPECIAL_IMM            0x30
+#define BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM    0x40
+#define BIND_OPCODE_SET_TYPE_IMM                     0x50
+#define BIND_OPCODE_SET_ADDEND_SLEB                  0x60
+#define BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB      0x70
+#define BIND_OPCODE_ADD_ADDR_ULEB                    0x80
+#define BIND_OPCODE_DO_BIND                          0x90
+#define BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB            0xa0
+#define BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED      0xb0
+#define BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB 0xc0
+
+inline void get(std::streambuf &stream, void *data, size_t size) {
+    _assert(stream.sgetn(static_cast<char *>(data), size) == size);
+}
+
+inline void put(std::streambuf &stream, const void *data, size_t size) {
+    _assert(stream.sputn(static_cast<const char *>(data), size) == size);
+}
+
+inline void pad(std::streambuf &stream, size_t size) {
+    char padding[size];
+    memset(padding, 0, size);
+    put(stream, padding, size);
+}
+
+template <typename Type_>
+Type_ Align(Type_ value, size_t align) {
+    value += align - 1;
+    value /= align;
+    value *= align;
+    return value;
+}
+
+static const uint8_t PageShift_(0x0c);
+static const uint32_t PageSize_(1 << PageShift_);
+
+static inline uint16_t Swap_(uint16_t value) {
     return
         ((value >>  8) & 0x00ff) |
         ((value <<  8) & 0xff00);
 }
 
-uint32_t Swap_(uint32_t value) {
+static inline uint32_t Swap_(uint32_t value) {
     value = ((value >>  8) & 0x00ff00ff) |
             ((value <<  8) & 0xff00ff00);
     value = ((value >> 16) & 0x0000ffff) |
@@ -171,86 +498,131 @@ uint32_t Swap_(uint32_t value) {
     return value;
 }
 
-int16_t Swap_(int16_t value) {
+static inline uint64_t Swap_(uint64_t value) {
+    value = (value & 0x00000000ffffffff) << 32 | (value & 0xffffffff00000000) >> 32;
+    value = (value & 0x0000ffff0000ffff) << 16 | (value & 0xffff0000ffff0000) >> 16;
+    value = (value & 0x00ff00ff00ff00ff) << 8  | (value & 0xff00ff00ff00ff00) >> 8;
+    return value;
+}
+
+static inline int16_t Swap_(int16_t value) {
     return Swap_(static_cast<uint16_t>(value));
 }
 
-int32_t Swap_(int32_t value) {
+static inline int32_t Swap_(int32_t value) {
     return Swap_(static_cast<uint32_t>(value));
 }
 
-uint16_t Swap(uint16_t value) {
-    return true ? Swap_(value) : value;
+static inline int64_t Swap_(int64_t value) {
+    return Swap_(static_cast<uint64_t>(value));
 }
 
-uint32_t Swap(uint32_t value) {
-    return true ? Swap_(value) : value;
+static bool little_(true);
+
+static inline uint16_t Swap(uint16_t value) {
+    return little_ ? Swap_(value) : value;
 }
 
-int16_t Swap(int16_t value) {
+static inline uint32_t Swap(uint32_t value) {
+    return little_ ? Swap_(value) : value;
+}
+
+static inline uint64_t Swap(uint64_t value) {
+    return little_ ? Swap_(value) : value;
+}
+
+static inline int16_t Swap(int16_t value) {
     return Swap(static_cast<uint16_t>(value));
 }
 
-int32_t Swap(int32_t value) {
+static inline int32_t Swap(int32_t value) {
     return Swap(static_cast<uint32_t>(value));
 }
 
-template <typename Target_>
-class Pointer;
+static inline int64_t Swap(int64_t value) {
+    return Swap(static_cast<uint64_t>(value));
+}
 
-class Framework {
+class Swapped {
+  protected:
+    bool swapped_;
+
+    Swapped() :
+        swapped_(false)
+    {
+    }
+
+  public:
+    Swapped(bool swapped) :
+        swapped_(swapped)
+    {
+    }
+
+    template <typename Type_>
+    Type_ Swap(Type_ value) const {
+        return swapped_ ? Swap_(value) : value;
+    }
+};
+
+class Data :
+    public Swapped
+{
   private:
     void *base_;
     size_t size_;
-    mach_header *mach_header_;
-    bool swapped_;
 
   public:
-    uint16_t Swap(uint16_t value) const {
-        return swapped_ ? Swap_(value) : value;
-    }
-
-    uint32_t Swap(uint32_t value) const {
-        return swapped_ ? Swap_(value) : value;
-    }
-
-    int16_t Swap(int16_t value) const {
-        return Swap(static_cast<uint16_t>(value));
-    }
-
-    int32_t Swap(int32_t value) const {
-        return Swap(static_cast<uint32_t>(value));
-    }
-
-    Framework(const char *framework_path) :
-        swapped_(false)
+    Data(void *base, size_t size) :
+        base_(base),
+        size_(size)
     {
-        base_ = map(framework_path, 0, _not(size_t), &size_, false);
-        fat_header *fat_header = reinterpret_cast<struct fat_header *>(base_);
+    }
 
-        if (Swap(fat_header->magic) == FAT_CIGAM) {
-            swapped_ = !swapped_;
-            goto fat;
-        } else if (Swap(fat_header->magic) != FAT_MAGIC)
-            mach_header_ = (mach_header *) base_;
-        else fat: {
-            size_t fat_narch = Swap(fat_header->nfat_arch);
-            fat_arch *fat_arch = reinterpret_cast<struct fat_arch *>(fat_header + 1);
-            size_t arch;
-            for (arch = 0; arch != fat_narch; ++arch) {
-                uint32_t arch_offset = Swap(fat_arch->offset);
-                mach_header_ = (mach_header *) ((uint8_t *) base_ + arch_offset);
-                goto found;
-                ++fat_arch;
-            }
+    void *GetBase() const {
+        return base_;
+    }
 
-            _assert(false);
+    size_t GetSize() const {
+        return size_;
+    }
+};
+
+class MachHeader :
+    public Data
+{
+  private:
+    bool bits64_;
+
+    struct mach_header *mach_header_;
+    struct load_command *load_command_;
+
+  public:
+    MachHeader(void *base, size_t size) :
+        Data(base, size)
+    {
+        mach_header_ = (mach_header *) base;
+
+        switch (Swap(mach_header_->magic)) {
+            case MH_CIGAM:
+                swapped_ = !swapped_;
+            case MH_MAGIC:
+                bits64_ = false;
+            break;
+
+            case MH_CIGAM_64:
+                swapped_ = !swapped_;
+            case MH_MAGIC_64:
+                bits64_ = true;
+            break;
+
+            default:
+                _assert(false);
         }
 
-      found:
-        if (Swap(mach_header_->magic) == MH_CIGAM)
-            swapped_ = !swapped_;
-        else _assert(Swap(mach_header_->magic) == MH_MAGIC);
+        void *post = mach_header_ + 1;
+        if (bits64_)
+            post = (uint32_t *) post + 1;
+        load_command_ = (struct load_command *) post;
 
         _assert(
             Swap(mach_header_->filetype) == MH_EXECUTE ||
@@ -259,22 +631,34 @@ class Framework {
         );
     }
 
+    bool Bits64() const {
+        return bits64_;
+    }
+
     struct mach_header *operator ->() const {
         return mach_header_;
     }
 
-    void *GetBase() {
-        return base_;
+    operator struct mach_header *() const {
+        return mach_header_;
     }
 
-    size_t GetSize() {
-        return size_;
+    uint32_t GetCPUType() const {
+        return Swap(mach_header_->cputype);
     }
 
-    std::vector<struct load_command *> GetLoadCommands() {
+    uint32_t GetCPUSubtype() const {
+        return Swap(mach_header_->cpusubtype) & 0xff;
+    }
+
+    struct load_command *GetLoadCommand() const {
+        return load_command_;
+    }
+
+    std::vector<struct load_command *> GetLoadCommands() const {
         std::vector<struct load_command *> load_commands;
 
-        struct load_command *load_command = reinterpret_cast<struct load_command *>(mach_header_ + 1);
+        struct load_command *load_command = load_command_;
         for (uint32_t cmd = 0; cmd != Swap(mach_header_->ncmds); ++cmd) {
             load_commands.push_back(load_command);
             load_command = (struct load_command *) ((uint8_t *) load_command + Swap(load_command->cmdsize));
@@ -283,112 +667,119 @@ class Framework {
         return load_commands;
     }
 
-    std::vector<segment_command *> GetSegments(const char *segment_name) {
-        std::vector<struct segment_command *> segment_commands;
-
+    void ForSection(const ldid::Functor<void (const char *, const char *, void *, size_t)> &code) const {
         _foreach (load_command, GetLoadCommands())
-            if (Swap((*load_command)->cmd) == LC_SEGMENT) {
-                segment_command *segment_command = reinterpret_cast<struct segment_command *>(*load_command);
-                if (strncmp(segment_command->segname, segment_name, 16) == 0)
-                    segment_commands.push_back(segment_command);
+            switch (Swap(load_command->cmd)) {
+                case LC_SEGMENT: {
+                    auto segment(reinterpret_cast<struct segment_command *>(load_command));
+                    code(segment->segname, NULL, GetOffset<void>(segment->fileoff), segment->filesize);
+                    auto section(reinterpret_cast<struct section *>(segment + 1));
+                    for (uint32_t i(0), e(Swap(segment->nsects)); i != e; ++i, ++section)
+                        code(segment->segname, section->sectname, GetOffset<void>(segment->fileoff + section->offset), section->size);
+                } break;
+
+                case LC_SEGMENT_64: {
+                    auto segment(reinterpret_cast<struct segment_command_64 *>(load_command));
+                    code(segment->segname, NULL, GetOffset<void>(segment->fileoff), segment->filesize);
+                    auto section(reinterpret_cast<struct section_64 *>(segment + 1));
+                    for (uint32_t i(0), e(Swap(segment->nsects)); i != e; ++i, ++section)
+                        code(segment->segname, section->sectname, GetOffset<void>(segment->fileoff + section->offset), section->size);
+                } break;
             }
-
-        return segment_commands;
-    }
-
-    std::vector<section *> GetSections(const char *segment_name, const char *section_name) {
-        std::vector<section *> sections;
-
-        _foreach (segment, GetSegments(segment_name)) {
-            section *section = (struct section *) (*segment + 1);
-
-            uint32_t sect;
-            for (sect = 0; sect != Swap((*segment)->nsects); ++sect) {
-                if (strncmp(section->sectname, section_name, 16) == 0)
-                    sections.push_back(section);
-                ++section;
-            }
-        }
-
-        return sections;
     }
 
     template <typename Target_>
-    Pointer<Target_> GetPointer(uint32_t address, const char *segment_name = NULL) {
-        load_command *load_command = (struct load_command *) (mach_header_ + 1);
-        uint32_t cmd;
-
-        for (cmd = 0; cmd != Swap(mach_header_->ncmds); ++cmd) {
-            if (Swap(load_command->cmd) == LC_SEGMENT) {
-                segment_command *segment_command = (struct segment_command *) load_command;
-                if (segment_name != NULL && strncmp(segment_command->segname, segment_name, 16) != 0)
-                    goto next_command;
-
-                section *sections = (struct section *) (segment_command + 1);
-
-                uint32_t sect;
-                for (sect = 0; sect != Swap(segment_command->nsects); ++sect) {
-                    section *section = &sections[sect];
-                    //printf("%s %u %p %p %u\n", segment_command->segname, sect, address, section->addr, section->size);
-                    if (address >= Swap(section->addr) && address < Swap(section->addr) + Swap(section->size)) {
-                        //printf("0x%.8x %s\n", address, segment_command->segname);
-                        return Pointer<Target_>(this, reinterpret_cast<Target_ *>(address - Swap(section->addr) + Swap(section->offset) + (char *) mach_header_));
-                    }
-                }
-            }
-
-          next_command:
-            load_command = (struct load_command *) ((char *) load_command + Swap(load_command->cmdsize));
-        }
-
-        return Pointer<Target_>(this);
-    }
-
-    template <typename Target_>
-    Pointer<Target_> GetOffset(uint32_t offset) {
-        return Pointer<Target_>(this, reinterpret_cast<Target_ *>(offset + (uint8_t *) mach_header_));
+    Target_ *GetOffset(uint32_t offset) const {
+        return reinterpret_cast<Target_ *>(offset + (uint8_t *) mach_header_);
     }
 };
 
-template <typename Target_>
-class Pointer {
+class FatMachHeader :
+    public MachHeader
+{
   private:
-    const Framework *framework_;
-    const Target_ *pointer_;
+    fat_arch *fat_arch_;
 
   public:
-    Pointer(const Framework *framework = NULL, const Target_ *pointer = NULL) :
-        framework_(framework),
-        pointer_(pointer)
+    FatMachHeader(void *base, size_t size, fat_arch *fat_arch) :
+        MachHeader(base, size),
+        fat_arch_(fat_arch)
     {
     }
 
-    operator const Target_ *() const {
-        return pointer_;
-    }
-
-    const Target_ *operator ->() const {
-        return pointer_;
-    }
-
-    Pointer<Target_> &operator ++() {
-        ++pointer_;
-        return *this;
-    }
-
-    template <typename Value_>
-    Value_ Swap(Value_ value) {
-        return framework_->Swap(value);
+    fat_arch *GetFatArch() const {
+        return fat_arch_;
     }
 };
 
-#define CSMAGIC_CODEDIRECTORY      0xfade0c02
-#define CSMAGIC_EMBEDDED_SIGNATURE 0xfade0cc0
-#define CSMAGIC_ENTITLEMENTS       0xfade7171
+class FatHeader :
+    public Data
+{
+  private:
+    fat_header *fat_header_;
+    std::vector<FatMachHeader> mach_headers_;
 
-#define CSSLOT_CODEDIRECTORY 0
-#define CSSLOT_REQUIREMENTS  2
-#define CSSLOT_ENTITLEMENTS  5
+  public:
+    FatHeader(void *base, size_t size) :
+        Data(base, size)
+    {
+        fat_header_ = reinterpret_cast<struct fat_header *>(base);
+
+        if (Swap(fat_header_->magic) == FAT_CIGAM) {
+            swapped_ = !swapped_;
+            goto fat;
+        } else if (Swap(fat_header_->magic) != FAT_MAGIC) {
+            fat_header_ = NULL;
+            mach_headers_.push_back(FatMachHeader(base, size, NULL));
+        } else fat: {
+            size_t fat_narch = Swap(fat_header_->nfat_arch);
+            fat_arch *fat_arch = reinterpret_cast<struct fat_arch *>(fat_header_ + 1);
+            size_t arch;
+            for (arch = 0; arch != fat_narch; ++arch) {
+                uint32_t arch_offset = Swap(fat_arch->offset);
+                uint32_t arch_size = Swap(fat_arch->size);
+                mach_headers_.push_back(FatMachHeader((uint8_t *) base + arch_offset, arch_size, fat_arch));
+                ++fat_arch;
+            }
+        }
+    }
+
+    std::vector<FatMachHeader> &GetMachHeaders() {
+        return mach_headers_;
+    }
+
+    bool IsFat() const {
+        return fat_header_ != NULL;
+    }
+
+    struct fat_header *operator ->() const {
+        return fat_header_;
+    }
+
+    operator struct fat_header *() const {
+        return fat_header_;
+    }
+};
+
+#define CSMAGIC_REQUIREMENT            uint32_t(0xfade0c00)
+#define CSMAGIC_REQUIREMENTS           uint32_t(0xfade0c01)
+#define CSMAGIC_CODEDIRECTORY          uint32_t(0xfade0c02)
+#define CSMAGIC_EMBEDDED_SIGNATURE     uint32_t(0xfade0cc0)
+#define CSMAGIC_EMBEDDED_SIGNATURE_OLD uint32_t(0xfade0b02)
+#define CSMAGIC_EMBEDDED_ENTITLEMENTS  uint32_t(0xfade7171)
+#define CSMAGIC_DETACHED_SIGNATURE     uint32_t(0xfade0cc1)
+#define CSMAGIC_BLOBWRAPPER            uint32_t(0xfade0b01)
+
+#define CSSLOT_CODEDIRECTORY uint32_t(0x00000)
+#define CSSLOT_INFOSLOT      uint32_t(0x00001)
+#define CSSLOT_REQUIREMENTS  uint32_t(0x00002)
+#define CSSLOT_RESOURCEDIR   uint32_t(0x00003)
+#define CSSLOT_APPLICATION   uint32_t(0x00004)
+#define CSSLOT_ENTITLEMENTS  uint32_t(0x00005)
+
+#define CSSLOT_SIGNATURESLOT uint32_t(0x10000)
+
+#define CS_HASHTYPE_SHA1 1
 
 struct BlobIndex {
     uint32_t type;
@@ -407,7 +798,6 @@ struct SuperBlob {
 } _packed;
 
 struct CodeDirectory {
-    struct Blob blob;
     uint32_t version;
     uint32_t flags;
     uint32_t hashOffset;
@@ -422,36 +812,1253 @@ struct CodeDirectory {
     uint32_t spare2;
 } _packed;
 
+#ifndef LDID_NOFLAGT
 extern "C" uint32_t hash(uint8_t *k, uint32_t length, uint32_t initval);
+#endif
 
-
-void sha1(uint8_t *hash, uint8_t *data, size_t size) {
-    SHA1Context context;
-    SHA1Reset(&context);
-    SHA1Input(&context, data, size);
-    SHA1Result(&context, hash);
+static void sha1(uint8_t *hash, const void *data, size_t size) {
+    LDID_SHA1(static_cast<const uint8_t *>(data), size, hash);
 }
 
-int main(int argc, const char *argv[]) {
-    bool flag_R(false);
-    bool flag_t(false);
-    bool flag_p(false);
-    bool flag_u(false);
+static void sha1(std::vector<char> &hash, const void *data, size_t size) {
+    hash.resize(LDID_SHA1_DIGEST_LENGTH);
+    sha1(reinterpret_cast<uint8_t *>(hash.data()), data, size);
+}
+
+struct CodesignAllocation {
+    FatMachHeader mach_header_;
+    uint32_t offset_;
+    uint32_t size_;
+    uint32_t limit_;
+    uint32_t alloc_;
+    uint32_t align_;
+
+    CodesignAllocation(FatMachHeader mach_header, size_t offset, size_t size, size_t limit, size_t alloc, size_t align) :
+        mach_header_(mach_header),
+        offset_(offset),
+        size_(size),
+        limit_(limit),
+        alloc_(alloc),
+        align_(align)
+    {
+    }
+};
+
+#ifndef LDID_NOTOOLS
+class File {
+  private:
+    int file_;
+
+  public:
+    File() :
+        file_(-1)
+    {
+    }
+
+    ~File() {
+        if (file_ != -1)
+            _syscall(close(file_));
+    }
+
+    void open(const char *path, int flags) {
+        _assert(file_ == -1);
+        file_ = _syscall(::open(path, flags));
+    }
+
+    int file() const {
+        return file_;
+    }
+};
+
+class Map {
+  private:
+    File file_;
+    void *data_;
+    size_t size_;
+
+    void clear() {
+        if (data_ == NULL)
+            return;
+        _syscall(munmap(data_, size_));
+        data_ = NULL;
+        size_ = 0;
+    }
+
+  public:
+    Map() :
+        data_(NULL),
+        size_(0)
+    {
+    }
+
+    Map(const std::string &path, int oflag, int pflag, int mflag) :
+        Map()
+    {
+        open(path, oflag, pflag, mflag);
+    }
+
+    Map(const std::string &path, bool edit) :
+        Map()
+    {
+        open(path, edit);
+    }
+
+    ~Map() {
+        clear();
+    }
+
+    bool empty() const {
+        return data_ == NULL;
+    }
+
+    void open(const std::string &path, int oflag, int pflag, int mflag) {
+        clear();
+
+        file_.open(path.c_str(), oflag);
+        int file(file_.file());
+
+        struct stat stat;
+        _syscall(fstat(file, &stat));
+        size_ = stat.st_size;
+
+        data_ = _syscall(mmap(NULL, size_, pflag, mflag, file, 0));
+    }
+
+    void open(const std::string &path, bool edit) {
+        if (edit)
+            open(path, O_RDWR, PROT_READ | PROT_WRITE, MAP_SHARED);
+        else
+            open(path, O_RDONLY, PROT_READ, MAP_PRIVATE);
+    }
+
+    void *data() const {
+        return data_;
+    }
+
+    size_t size() const {
+        return size_;
+    }
+
+    operator std::string() const {
+        return std::string(static_cast<char *>(data_), size_);
+    }
+};
+#endif
+
+namespace ldid {
+
+static void Allocate(const void *idata, size_t isize, std::streambuf &output, const Functor<size_t (const MachHeader &, size_t)> &allocate, const Functor<size_t (const MachHeader &, std::streambuf &output, size_t, const std::string &, const char *)> &save) {
+    FatHeader source(const_cast<void *>(idata), isize);
+
+    size_t offset(0);
+    if (source.IsFat())
+        offset += sizeof(fat_header) + sizeof(fat_arch) * source.Swap(source->nfat_arch);
+
+    std::vector<CodesignAllocation> allocations;
+    _foreach (mach_header, source.GetMachHeaders()) {
+        struct linkedit_data_command *signature(NULL);
+        struct symtab_command *symtab(NULL);
+
+        _foreach (load_command, mach_header.GetLoadCommands()) {
+            uint32_t cmd(mach_header.Swap(load_command->cmd));
+            if (false);
+            else if (cmd == LC_CODE_SIGNATURE)
+                signature = reinterpret_cast<struct linkedit_data_command *>(load_command);
+            else if (cmd == LC_SYMTAB)
+                symtab = reinterpret_cast<struct symtab_command *>(load_command);
+        }
+
+        size_t size;
+        if (signature == NULL)
+            size = mach_header.GetSize();
+        else {
+            size = mach_header.Swap(signature->dataoff);
+            _assert(size <= mach_header.GetSize());
+        }
+
+        if (symtab != NULL) {
+            auto end(mach_header.Swap(symtab->stroff) + mach_header.Swap(symtab->strsize));
+            _assert(end <= size);
+            _assert(end >= size - 0x10);
+            size = end;
+        }
+
+        size_t alloc(allocate(mach_header, size));
+
+        auto *fat_arch(mach_header.GetFatArch());
+        uint32_t align;
+
+        if (fat_arch != NULL)
+            align = source.Swap(fat_arch->align);
+        else switch (mach_header.GetCPUType()) {
+            case CPU_TYPE_POWERPC:
+            case CPU_TYPE_POWERPC64:
+            case CPU_TYPE_X86:
+            case CPU_TYPE_X86_64:
+                align = 0xc;
+                break;
+            case CPU_TYPE_ARM:
+            case CPU_TYPE_ARM64:
+                align = 0xe;
+                break;
+            default:
+                align = 0x0;
+                break;
+        }
+
+        offset = Align(offset, 1 << align);
+
+        uint32_t limit(size);
+        if (alloc != 0)
+            limit = Align(limit, 0x10);
+
+        allocations.push_back(CodesignAllocation(mach_header, offset, size, limit, alloc, align));
+        offset += size + alloc;
+        offset = Align(offset, 0x10);
+    }
+
+    size_t position(0);
+
+    if (source.IsFat()) {
+        fat_header fat_header;
+        fat_header.magic = Swap(FAT_MAGIC);
+        fat_header.nfat_arch = Swap(uint32_t(allocations.size()));
+        put(output, &fat_header, sizeof(fat_header));
+        position += sizeof(fat_header);
+
+        _foreach (allocation, allocations) {
+            auto &mach_header(allocation.mach_header_);
+
+            fat_arch fat_arch;
+            fat_arch.cputype = Swap(mach_header->cputype);
+            fat_arch.cpusubtype = Swap(mach_header->cpusubtype);
+            fat_arch.offset = Swap(allocation.offset_);
+            fat_arch.size = Swap(allocation.limit_ + allocation.alloc_);
+            fat_arch.align = Swap(allocation.align_);
+            put(output, &fat_arch, sizeof(fat_arch));
+            position += sizeof(fat_arch);
+        }
+    }
+
+    _foreach (allocation, allocations) {
+        auto &mach_header(allocation.mach_header_);
+
+        pad(output, allocation.offset_ - position);
+        position = allocation.offset_;
+
+        std::vector<std::string> commands;
+
+        _foreach (load_command, mach_header.GetLoadCommands()) {
+            std::string copy(reinterpret_cast<const char *>(load_command), load_command->cmdsize);
+
+            switch (mach_header.Swap(load_command->cmd)) {
+                case LC_CODE_SIGNATURE:
+                    continue;
+                break;
+
+                case LC_SEGMENT: {
+                    auto segment_command(reinterpret_cast<struct segment_command *>(&copy[0]));
+                    if (strncmp(segment_command->segname, "__LINKEDIT", 16) != 0)
+                        break;
+                    size_t size(mach_header.Swap(allocation.limit_ + allocation.alloc_ - mach_header.Swap(segment_command->fileoff)));
+                    segment_command->filesize = size;
+                    segment_command->vmsize = Align(size, 1 << allocation.align_);
+                } break;
+
+                case LC_SEGMENT_64: {
+                    auto segment_command(reinterpret_cast<struct segment_command_64 *>(&copy[0]));
+                    if (strncmp(segment_command->segname, "__LINKEDIT", 16) != 0)
+                        break;
+                    size_t size(mach_header.Swap(allocation.limit_ + allocation.alloc_ - mach_header.Swap(segment_command->fileoff)));
+                    segment_command->filesize = size;
+                    segment_command->vmsize = Align(size, 1 << allocation.align_);
+                } break;
+            }
+
+            commands.push_back(copy);
+        }
+
+        if (allocation.alloc_ != 0) {
+            linkedit_data_command signature;
+            signature.cmd = mach_header.Swap(LC_CODE_SIGNATURE);
+            signature.cmdsize = mach_header.Swap(uint32_t(sizeof(signature)));
+            signature.dataoff = mach_header.Swap(allocation.limit_);
+            signature.datasize = mach_header.Swap(allocation.alloc_);
+            commands.push_back(std::string(reinterpret_cast<const char *>(&signature), sizeof(signature)));
+        }
+
+        size_t begin(position);
+
+        uint32_t after(0);
+        _foreach(command, commands)
+            after += command.size();
+
+        std::stringbuf altern;
+
+        struct mach_header header(*mach_header);
+        header.ncmds = mach_header.Swap(uint32_t(commands.size()));
+        header.sizeofcmds = mach_header.Swap(after);
+        put(output, &header, sizeof(header));
+        put(altern, &header, sizeof(header));
+        position += sizeof(header);
+
+        if (mach_header.Bits64()) {
+            auto pad(mach_header.Swap(uint32_t(0)));
+            put(output, &pad, sizeof(pad));
+            put(altern, &pad, sizeof(pad));
+            position += sizeof(pad);
+        }
+
+        _foreach(command, commands) {
+            put(output, command.data(), command.size());
+            put(altern, command.data(), command.size());
+            position += command.size();
+        }
+
+        uint32_t before(mach_header.Swap(mach_header->sizeofcmds));
+        if (before > after) {
+            pad(output, before - after);
+            pad(altern, before - after);
+            position += before - after;
+        }
+
+        auto top(reinterpret_cast<char *>(mach_header.GetBase()));
+
+        std::string overlap(altern.str());
+        overlap.append(top + overlap.size(), Align(overlap.size(), 0x1000) - overlap.size());
+
+        put(output, top + (position - begin), allocation.size_ - (position - begin));
+        position = begin + allocation.size_;
+
+        pad(output, allocation.limit_ - allocation.size_);
+        position += allocation.limit_ - allocation.size_;
+
+        size_t saved(save(mach_header, output, allocation.limit_, overlap, top));
+        if (allocation.alloc_ > saved)
+            pad(output, allocation.alloc_ - saved);
+        position += allocation.alloc_;
+    }
+}
+
+}
+
+typedef std::map<uint32_t, std::string> Blobs;
+
+static void insert(Blobs &blobs, uint32_t slot, const std::stringbuf &buffer) {
+    auto value(buffer.str());
+    std::swap(blobs[slot], value);
+}
+
+static void insert(Blobs &blobs, uint32_t slot, uint32_t magic, const std::stringbuf &buffer) {
+    auto value(buffer.str());
+    Blob blob;
+    blob.magic = Swap(magic);
+    blob.length = Swap(uint32_t(sizeof(blob) + value.size()));
+    value.insert(0, reinterpret_cast<char *>(&blob), sizeof(blob));
+    std::swap(blobs[slot], value);
+}
+
+static size_t put(std::streambuf &output, uint32_t magic, const Blobs &blobs) {
+    size_t total(0);
+    _foreach (blob, blobs)
+        total += blob.second.size();
+
+    struct SuperBlob super;
+    super.blob.magic = Swap(magic);
+    super.blob.length = Swap(uint32_t(sizeof(SuperBlob) + blobs.size() * sizeof(BlobIndex) + total));
+    super.count = Swap(uint32_t(blobs.size()));
+    put(output, &super, sizeof(super));
+
+    size_t offset(sizeof(SuperBlob) + sizeof(BlobIndex) * blobs.size());
+
+    _foreach (blob, blobs) {
+        BlobIndex index;
+        index.type = Swap(blob.first);
+        index.offset = Swap(uint32_t(offset));
+        put(output, &index, sizeof(index));
+        offset += blob.second.size();
+    }
+
+    _foreach (blob, blobs)
+        put(output, blob.second.data(), blob.second.size());
+
+    return offset;
+}
+
+#ifndef LDID_NOSMIME
+class Buffer {
+  private:
+    BIO *bio_;
+
+  public:
+    Buffer(BIO *bio) :
+        bio_(bio)
+    {
+        _assert(bio_ != NULL);
+    }
+
+    Buffer() :
+        bio_(BIO_new(BIO_s_mem()))
+    {
+    }
+
+    Buffer(const char *data, size_t size) :
+        Buffer(BIO_new_mem_buf(const_cast<char *>(data), size))
+    {
+    }
+
+    Buffer(const std::string &data) :
+        Buffer(data.data(), data.size())
+    {
+    }
+
+    Buffer(PKCS7 *pkcs) :
+        Buffer()
+    {
+        _assert(i2d_PKCS7_bio(bio_, pkcs) != 0);
+    }
+
+    ~Buffer() {
+        BIO_free_all(bio_);
+    }
+
+    operator BIO *() const {
+        return bio_;
+    }
+
+    explicit operator std::string() const {
+        char *data;
+        auto size(BIO_get_mem_data(bio_, &data));
+        return std::string(data, size);
+    }
+};
+
+class Stuff {
+  private:
+    PKCS12 *value_;
+    EVP_PKEY *key_;
+    X509 *cert_;
+    STACK_OF(X509) *ca_;
+
+  public:
+    Stuff(BIO *bio) :
+        value_(d2i_PKCS12_bio(bio, NULL)),
+        ca_(NULL)
+    {
+        _assert(value_ != NULL);
+        _assert(PKCS12_parse(value_, "", &key_, &cert_, &ca_) != 0);
+        _assert(key_ != NULL);
+        _assert(cert_ != NULL);
+    }
+
+    Stuff(const std::string &data) :
+        Stuff(Buffer(data))
+    {
+    }
+
+    ~Stuff() {
+        sk_X509_pop_free(ca_, X509_free);
+        X509_free(cert_);
+        EVP_PKEY_free(key_);
+        PKCS12_free(value_);
+    }
+
+    operator PKCS12 *() const {
+        return value_;
+    }
+
+    operator EVP_PKEY *() const {
+        return key_;
+    }
+
+    operator X509 *() const {
+        return cert_;
+    }
+
+    operator STACK_OF(X509) *() const {
+        return ca_;
+    }
+};
+
+class Signature {
+  private:
+    PKCS7 *value_;
+
+  public:
+    Signature(const Stuff &stuff, const Buffer &data) :
+        value_(PKCS7_sign(stuff, stuff, stuff, data, PKCS7_BINARY | PKCS7_DETACHED))
+    {
+        _assert(value_ != NULL);
+    }
+
+    ~Signature() {
+        PKCS7_free(value_);
+    }
+
+    operator PKCS7 *() const {
+        return value_;
+    }
+};
+#endif
+
+class NullBuffer :
+    public std::streambuf
+{
+  public:
+    virtual std::streamsize xsputn(const char_type *data, std::streamsize size) {
+        return size;
+    }
+
+    virtual int_type overflow(int_type next) {
+        return next;
+    }
+};
+
+class HashBuffer :
+    public std::streambuf
+{
+  private:
+    std::vector<char> &hash_;
+    LDID_SHA1_CTX context_;
+
+  public:
+    HashBuffer(std::vector<char> &hash) :
+        hash_(hash)
+    {
+        LDID_SHA1_Init(&context_);
+    }
+
+    ~HashBuffer() {
+        hash_.resize(LDID_SHA1_DIGEST_LENGTH);
+        LDID_SHA1_Final(reinterpret_cast<uint8_t *>(hash_.data()), &context_);
+    }
+
+    virtual std::streamsize xsputn(const char_type *data, std::streamsize size) {
+        LDID_SHA1_Update(&context_, data, size);
+        return size;
+    }
+
+    virtual int_type overflow(int_type next) {
+        if (next == traits_type::eof())
+            return sync();
+        char value(next);
+        xsputn(&value, 1);
+        return next;
+    }
+};
+
+class HashProxy :
+    public HashBuffer
+{
+  private:
+    std::streambuf &buffer_;
+
+  public:
+    HashProxy(std::vector<char> &hash, std::streambuf &buffer) :
+        HashBuffer(hash),
+        buffer_(buffer)
+    {
+    }
+
+    virtual std::streamsize xsputn(const char_type *data, std::streamsize size) {
+        _assert(HashBuffer::xsputn(data, size) == size);
+        return buffer_.sputn(data, size);
+    }
+};
+
+#ifndef LDID_NOTOOLS
+static bool Starts(const std::string &lhs, const std::string &rhs) {
+    return lhs.size() >= rhs.size() && lhs.compare(0, rhs.size(), rhs) == 0;
+}
+
+class Split {
+  public:
+    std::string dir;
+    std::string base;
+
+    Split(const std::string &path) {
+        size_t slash(path.rfind('/'));
+        if (slash == std::string::npos)
+            base = path;
+        else {
+            dir = path.substr(0, slash + 1);
+            base = path.substr(slash + 1);
+        }
+    }
+};
+
+static void mkdir_p(const std::string &path) {
+    if (path.empty())
+        return;
+#ifdef __WIN32__
+    if (_syscall(mkdir(path.c_str()), EEXIST) == -EEXIST)
+        return;
+#else
+    if (_syscall(mkdir(path.c_str(), 0755), EEXIST) == -EEXIST)
+        return;
+#endif
+    auto slash(path.rfind('/', path.size() - 1));
+    if (slash == std::string::npos)
+        return;
+    mkdir_p(path.substr(0, slash));
+}
+
+static std::string Temporary(std::filebuf &file, const Split &split) {
+    std::string temp(split.dir + ".ldid." + split.base);
+    mkdir_p(split.dir);
+    _assert_(file.open(temp.c_str(), std::ios::out | std::ios::trunc | std::ios::binary) == &file, "open(): %s", temp.c_str());
+    return temp;
+}
+
+static void Commit(const std::string &path, const std::string &temp) {
+    struct stat info;
+    if (_syscall(stat(path.c_str(), &info), ENOENT) == 0) {
+#ifndef __WIN32__
+        _syscall(chown(temp.c_str(), info.st_uid, info.st_gid));
+#endif
+        _syscall(chmod(temp.c_str(), info.st_mode));
+    }
+
+    _syscall(rename(temp.c_str(), path.c_str()));
+}
+#endif
+
+namespace ldid {
+
+void Sign(const void *idata, size_t isize, std::streambuf &output, const std::string &identifier, const std::string &entitlements, const std::string &key, const Slots &slots) {
+    Allocate(idata, isize, output, fun([&](const MachHeader &mach_header, size_t size) -> size_t {
+        size_t alloc(sizeof(struct SuperBlob));
+
+        uint32_t special(0);
+
+        special = std::max(special, CSSLOT_REQUIREMENTS);
+        alloc += sizeof(struct BlobIndex);
+        alloc += 0xc;
+
+        if (!entitlements.empty()) {
+            special = std::max(special, CSSLOT_ENTITLEMENTS);
+            alloc += sizeof(struct BlobIndex);
+            alloc += sizeof(struct Blob);
+            alloc += entitlements.size();
+        }
+
+        special = std::max(special, CSSLOT_CODEDIRECTORY);
+        alloc += sizeof(struct BlobIndex);
+        alloc += sizeof(struct Blob);
+        alloc += sizeof(struct CodeDirectory);
+        alloc += identifier.size() + 1;
+
+        if (!key.empty()) {
+            alloc += sizeof(struct BlobIndex);
+            alloc += sizeof(struct Blob);
+            // XXX: this is just a "sufficiently large number"
+            alloc += 0x3000;
+        }
+
+        _foreach (slot, slots)
+            special = std::max(special, slot.first);
+
+        mach_header.ForSection(fun([&](const char *segment, const char *section, void *data, size_t size) {
+            if (strcmp(segment, "__TEXT") == 0 && section != NULL && strcmp(section, "__info_plist") == 0)
+                special = std::max(special, CSSLOT_INFOSLOT);
+        }));
+
+        uint32_t normal((size + PageSize_ - 1) / PageSize_);
+        alloc = Align(alloc + (special + normal) * LDID_SHA1_DIGEST_LENGTH, 16);
+        return alloc;
+    }), fun([&](const MachHeader &mach_header, std::streambuf &output, size_t limit, const std::string &overlap, const char *top) -> size_t {
+        Blobs blobs;
+
+        if (true) {
+            std::stringbuf data;
+
+            Blobs requirements;
+            put(data, CSMAGIC_REQUIREMENTS, requirements);
+
+            insert(blobs, CSSLOT_REQUIREMENTS, data);
+        }
+
+        if (!entitlements.empty()) {
+            std::stringbuf data;
+            put(data, entitlements.data(), entitlements.size());
+            insert(blobs, CSSLOT_ENTITLEMENTS, CSMAGIC_EMBEDDED_ENTITLEMENTS, data);
+        }
+
+        if (true) {
+            std::stringbuf data;
+
+            Slots posts(slots);
+
+            mach_header.ForSection(fun([&](const char *segment, const char *section, void *data, size_t size) {
+                if (strcmp(segment, "__TEXT") == 0 && section != NULL && strcmp(section, "__info_plist") == 0)
+                    sha1(posts[CSSLOT_INFOSLOT], data, size);
+            }));
+
+            uint32_t special(0);
+            _foreach (blob, blobs)
+                special = std::max(special, blob.first);
+            _foreach (slot, posts)
+                special = std::max(special, slot.first);
+            uint32_t normal((limit + PageSize_ - 1) / PageSize_);
+
+            CodeDirectory directory;
+            directory.version = Swap(uint32_t(0x00020001));
+            directory.flags = Swap(uint32_t(0));
+            directory.hashOffset = Swap(uint32_t(sizeof(Blob) + sizeof(CodeDirectory) + identifier.size() + 1 + LDID_SHA1_DIGEST_LENGTH * special));
+            directory.identOffset = Swap(uint32_t(sizeof(Blob) + sizeof(CodeDirectory)));
+            directory.nSpecialSlots = Swap(special);
+            directory.codeLimit = Swap(uint32_t(limit));
+            directory.nCodeSlots = Swap(normal);
+            directory.hashSize = LDID_SHA1_DIGEST_LENGTH;
+            directory.hashType = CS_HASHTYPE_SHA1;
+            directory.spare1 = 0x00;
+            directory.pageSize = PageShift_;
+            directory.spare2 = Swap(uint32_t(0));
+            put(data, &directory, sizeof(directory));
+
+            put(data, identifier.c_str(), identifier.size() + 1);
+
+            uint8_t storage[special + normal][LDID_SHA1_DIGEST_LENGTH];
+            uint8_t (*hashes)[LDID_SHA1_DIGEST_LENGTH] = storage + special;
+
+            memset(storage, 0, sizeof(*storage) * special);
+
+            _foreach (blob, blobs) {
+                auto local(reinterpret_cast<const Blob *>(&blob.second[0]));
+                sha1((uint8_t *) (hashes - blob.first), local, Swap(local->length));
+            }
+
+            _foreach (slot, posts) {
+                _assert(sizeof(*hashes) == slot.second.size());
+                memcpy(hashes - slot.first, slot.second.data(), slot.second.size());
+            }
+
+            if (normal != 1)
+                for (size_t i = 0; i != normal - 1; ++i)
+                    sha1(hashes[i], (PageSize_ * i < overlap.size() ? overlap.data() : top) + PageSize_ * i, PageSize_);
+            if (normal != 0)
+                sha1(hashes[normal - 1], top + PageSize_ * (normal - 1), ((limit - 1) % PageSize_) + 1);
+
+            put(data, storage, sizeof(storage));
+
+            insert(blobs, CSSLOT_CODEDIRECTORY, CSMAGIC_CODEDIRECTORY, data);
+        }
+
+#ifndef LDID_NOSMIME
+        if (!key.empty()) {
+            std::stringbuf data;
+            const std::string &sign(blobs[CSSLOT_CODEDIRECTORY]);
+
+            Stuff stuff(key);
+            Buffer bio(sign);
+
+            Signature signature(stuff, sign);
+            Buffer result(signature);
+            std::string value(result);
+            put(data, value.data(), value.size());
+
+            insert(blobs, CSSLOT_SIGNATURESLOT, CSMAGIC_BLOBWRAPPER, data);
+        }
+#endif
+
+        return put(output, CSMAGIC_EMBEDDED_SIGNATURE, blobs);
+    }));
+}
+
+#ifndef LDID_NOTOOLS
+static void Unsign(void *idata, size_t isize, std::streambuf &output) {
+    Allocate(idata, isize, output, fun([](const MachHeader &mach_header, size_t size) -> size_t {
+        return 0;
+    }), fun([](const MachHeader &mach_header, std::streambuf &output, size_t limit, const std::string &overlap, const char *top) -> size_t {
+        return 0;
+    }));
+}
+
+std::string DiskFolder::Path(const std::string &path) {
+    return path_ + "/" + path;
+}
+
+DiskFolder::DiskFolder(const std::string &path) :
+    path_(path)
+{
+}
+
+DiskFolder::~DiskFolder() {
+    if (!std::uncaught_exception())
+        for (const auto &commit : commit_)
+            Commit(commit.first, commit.second);
+}
+
+void DiskFolder::Find(const std::string &root, const std::string &base, const Functor<void (const std::string &, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &)>&code) {
+    std::string path(Path(root) + base);
+
+    DIR *dir(opendir(path.c_str()));
+    _assert(dir != NULL);
+    _scope({ _syscall(closedir(dir)); });
+
+    while (auto child = readdir(dir)) {
+        std::string name(child->d_name);
+        if (name == "." || name == "..")
+            continue;
+        if (Starts(name, ".ldid."))
+            continue;
+
+        bool directory;
+
+#ifdef __WIN32__
+        struct stat info;
+        _syscall(stat(path.c_str(), &info));
+        if (false);
+        else if (S_ISDIR(info.st_mode))
+            directory = true;
+        else if (S_ISREG(info.st_mode))
+            directory = false;
+        else
+            _assert_(false, "st_mode=%x", info.st_mode);
+#else
+        switch (child->d_type) {
+            case DT_DIR:
+                directory = true;
+                break;
+            case DT_REG:
+                directory = false;
+                break;
+            default:
+                _assert_(false, "d_type=%u", child->d_type);
+        }
+#endif
+
+        if (directory)
+            Find(root, base + name + "/", code);
+        else
+            code(base + name, fun([&](const Functor<void (std::streambuf &, std::streambuf &)> &code) {
+                std::string access(root + base + name);
+                _assert_(Open(access, fun([&](std::streambuf &data) {
+                    NullBuffer save;
+                    code(data, save);
+                })), "open(): %s", access.c_str());
+            }));
+    }
+}
+
+void DiskFolder::Save(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    std::filebuf save;
+    auto from(Path(path));
+    commit_[from] = Temporary(save, from);
+    code(save);
+}
+
+bool DiskFolder::Open(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    std::filebuf data;
+    auto result(data.open(Path(path).c_str(), std::ios::binary | std::ios::in));
+    if (result == NULL)
+        return false;
+    _assert(result == &data);
+    code(data);
+    return true;
+}
+
+void DiskFolder::Find(const std::string &path, const Functor<void (const std::string &, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &)>&code) {
+    Find(path, "", code);
+}
+#endif
+
+SubFolder::SubFolder(Folder &parent, const std::string &path) :
+    parent_(parent),
+    path_(path)
+{
+}
+
+void SubFolder::Save(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    return parent_.Save(path_ + path, code);
+}
+
+bool SubFolder::Open(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    return parent_.Open(path_ + path, code);
+}
+
+void SubFolder::Find(const std::string &path, const Functor<void (const std::string &, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &)> &code) {
+    return parent_.Find(path_ + path, code);
+}
+
+UnionFolder::UnionFolder(Folder &parent) :
+    parent_(parent)
+{
+}
+
+void UnionFolder::Save(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    return parent_.Save(path, code);
+}
+
+bool UnionFolder::Open(const std::string &path, const Functor<void (std::streambuf &)> &code) {
+    auto file(files_.find(path));
+    if (file == files_.end())
+        return parent_.Open(path, code);
+
+    auto &data(file->second);
+    data.pubseekpos(0, std::ios::in);
+    code(data);
+    return true;
+}
+
+void UnionFolder::Find(const std::string &path, const Functor<void (const std::string &, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &)> &code) {
+    parent_.Find(path, fun([&](const std::string &name, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &save) {
+        if (files_.find(name) == files_.end())
+            code(name, save);
+    }));
+
+    for (auto &file : files_)
+        code(file.first, fun([&](const Functor<void (std::streambuf &, std::streambuf &)> &code) {
+            parent_.Save(file.first, fun([&](std::streambuf &save) {
+                file.second.pubseekpos(0, std::ios::in);
+                code(file.second, save);
+            }));
+        }));
+}
+
+#ifndef LDID_NOTOOLS
+static size_t copy(std::streambuf &source, std::streambuf &target) {
+    size_t total(0);
+    for (;;) {
+        char data[4096];
+        size_t writ(source.sgetn(data, sizeof(data)));
+        if (writ == 0)
+            break;
+        _assert(target.sputn(data, writ) == writ);
+        total += writ;
+    }
+    return total;
+}
+
+#ifndef LDID_NOPLIST
+static plist_t plist(const std::string &data) {
+    plist_t plist(NULL);
+    if (Starts(data, "bplist00"))
+        plist_from_bin(data.data(), data.size(), &plist);
+    else
+        plist_from_xml(data.data(), data.size(), &plist);
+    _assert(plist != NULL);
+    return plist;
+}
+
+static void plist_d(std::streambuf &buffer, const Functor<void (plist_t)> &code) {
+    std::stringbuf data;
+    copy(buffer, data);
+    auto node(plist(data.str()));
+    _scope({ plist_free(node); });
+    _assert(plist_get_node_type(node) == PLIST_DICT);
+    code(node);
+}
+
+static std::string plist_s(plist_t node) {
+    _assert(node != NULL);
+    _assert(plist_get_node_type(node) == PLIST_STRING);
+    char *data;
+    plist_get_string_val(node, &data);
+    _scope({ free(data); });
+    return data;
+}
+#endif
+
+enum Mode {
+    NoMode,
+    OptionalMode,
+    OmitMode,
+    NestedMode,
+    TopMode,
+};
+
+class Expression {
+  private:
+    regex_t regex_;
+
+  public:
+    Expression(const std::string &code) {
+        _assert_(regcomp(&regex_, code.c_str(), REG_EXTENDED | REG_NOSUB) == 0, "regcomp()");
+    }
+
+    ~Expression() {
+        regfree(&regex_);
+    }
+
+    bool operator ()(const std::string &data) const {
+        auto value(regexec(&regex_, data.c_str(), 0, NULL, 0));
+        if (value == REG_NOMATCH)
+            return false;
+        _assert_(value == 0, "regexec()");
+        return true;
+    }
+};
+
+struct Rule {
+    unsigned weight_;
+    Mode mode_;
+    std::string code_;
+
+    mutable std::auto_ptr<Expression> regex_;
+
+    Rule(unsigned weight, Mode mode, const std::string &code) :
+        weight_(weight),
+        mode_(mode),
+        code_(code)
+    {
+    }
+
+    Rule(const Rule &rhs) :
+        weight_(rhs.weight_),
+        mode_(rhs.mode_),
+        code_(rhs.code_)
+    {
+    }
+
+    void Compile() const {
+        regex_.reset(new Expression(code_));
+    }
+
+    bool operator ()(const std::string &data) const {
+        _assert(regex_.get() != NULL);
+        return (*regex_)(data);
+    }
+
+    bool operator <(const Rule &rhs) const {
+        if (weight_ > rhs.weight_)
+            return true;
+        if (weight_ < rhs.weight_)
+            return false;
+        return mode_ > rhs.mode_;
+    }
+};
+
+struct RuleCode {
+    bool operator ()(const Rule *lhs, const Rule *rhs) const {
+        return lhs->code_ < rhs->code_;
+    }
+};
+
+#ifndef LDID_NOPLIST
+std::string Bundle(const std::string &root, Folder &folder, const std::string &key, std::map<std::string, std::vector<char>> &remote, const std::string &entitlements) {
+    std::string executable;
+    std::string identifier;
+
+    static const std::string info("Info.plist");
+
+    _assert_(folder.Open(info, fun([&](std::streambuf &buffer) {
+        plist_d(buffer, fun([&](plist_t node) {
+            executable = plist_s(plist_dict_get_item(node, "CFBundleExecutable"));
+            identifier = plist_s(plist_dict_get_item(node, "CFBundleIdentifier"));
+        }));
+    })), "open(): Info.plist");
+
+    std::map<std::string, std::multiset<Rule>> versions;
+
+    auto &rules1(versions[""]);
+    auto &rules2(versions["2"]);
+
+    static const std::string signature("_CodeSignature/CodeResources");
+
+    folder.Open(signature, fun([&](std::streambuf &buffer) {
+        plist_d(buffer, fun([&](plist_t node) {
+            // XXX: maybe attempt to preserve existing rules
+        }));
+    }));
+
+    if (true) {
+        rules1.insert(Rule{1, NoMode, "^"});
+        rules1.insert(Rule{10000, OmitMode, "^(Frameworks/[^/]+\\.framework/|PlugIns/[^/]+\\.appex/|PlugIns/[^/]+\\.appex/Frameworks/[^/]+\\.framework/|())SC_Info/[^/]+\\.(sinf|supf|supp)$"});
+        rules1.insert(Rule{1000, OptionalMode, "^.*\\.lproj/"});
+        rules1.insert(Rule{1100, OmitMode, "^.*\\.lproj/locversion.plist$"});
+        rules1.insert(Rule{10000, OmitMode, "^Watch/[^/]+\\.app/(Frameworks/[^/]+\\.framework/|PlugIns/[^/]+\\.appex/|PlugIns/[^/]+\\.appex/Frameworks/[^/]+\\.framework/)SC_Info/[^/]+\\.(sinf|supf|supp)$"});
+        rules1.insert(Rule{1, NoMode, "^version.plist$"});
+    }
+
+    if (true) {
+        rules2.insert(Rule{11, NoMode, ".*\\.dSYM($|/)"});
+        rules2.insert(Rule{20, NoMode, "^"});
+        rules2.insert(Rule{2000, OmitMode, "^(.*/)?\\.DS_Store$"});
+        rules2.insert(Rule{10000, OmitMode, "^(Frameworks/[^/]+\\.framework/|PlugIns/[^/]+\\.appex/|PlugIns/[^/]+\\.appex/Frameworks/[^/]+\\.framework/|())SC_Info/[^/]+\\.(sinf|supf|supp)$"});
+        rules2.insert(Rule{10, NestedMode, "^(Frameworks|SharedFrameworks|PlugIns|Plug-ins|XPCServices|Helpers|MacOS|Library/(Automator|Spotlight|LoginItems))/"});
+        rules2.insert(Rule{1, NoMode, "^.*"});
+        rules2.insert(Rule{1000, OptionalMode, "^.*\\.lproj/"});
+        rules2.insert(Rule{1100, OmitMode, "^.*\\.lproj/locversion.plist$"});
+        rules2.insert(Rule{20, OmitMode, "^Info\\.plist$"});
+        rules2.insert(Rule{20, OmitMode, "^PkgInfo$"});
+        rules2.insert(Rule{10000, OmitMode, "^Watch/[^/]+\\.app/(Frameworks/[^/]+\\.framework/|PlugIns/[^/]+\\.appex/|PlugIns/[^/]+\\.appex/Frameworks/[^/]+\\.framework/)SC_Info/[^/]+\\.(sinf|supf|supp)$"});
+        rules2.insert(Rule{10, NestedMode, "^[^/]+$"});
+        rules2.insert(Rule{20, NoMode, "^embedded\\.provisionprofile$"});
+        rules2.insert(Rule{20, NoMode, "^version\\.plist$"});
+    }
+
+    std::map<std::string, std::vector<char>> local;
+
+    static Expression nested("^PlugIns/[^/]*\\.appex/Info\\.plist$");
+
+    folder.Find("", fun([&](const std::string &name, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &code) {
+        if (!nested(name))
+            return;
+        auto bundle(root + Split(name).dir);
+        SubFolder subfolder(folder, bundle);
+        Bundle(bundle, subfolder, key, local, "");
+    }));
+
+    folder.Find("", fun([&](const std::string &name, const Functor<void (const Functor<void (std::streambuf &, std::streambuf &)> &)> &code) {
+        if (name == executable || name == signature)
+            return;
+
+        auto &hash(local[name]);
+        if (!hash.empty())
+            return;
+
+        code(fun([&](std::streambuf &data, std::streambuf &save) {
+            HashProxy proxy(hash, save);
+            copy(data, proxy);
+        }));
+
+        _assert(hash.size() == LDID_SHA1_DIGEST_LENGTH);
+    }));
+
+    auto plist(plist_new_dict());
+    _scope({ plist_free(plist); });
+
+    for (const auto &version : versions) {
+        auto files(plist_new_dict());
+        plist_dict_set_item(plist, ("files" + version.first).c_str(), files);
+
+        for (const auto &rule : version.second)
+            rule.Compile();
+
+        for (const auto &hash : local)
+            for (const auto &rule : version.second)
+                if (rule(hash.first)) {
+                    if (rule.mode_ == NoMode)
+                        plist_dict_set_item(files, hash.first.c_str(), plist_new_data(hash.second.data(), hash.second.size()));
+                    else if (rule.mode_ == OptionalMode) {
+                        auto entry(plist_new_dict());
+                        plist_dict_set_item(entry, "hash", plist_new_data(hash.second.data(), hash.second.size()));
+                        plist_dict_set_item(entry, "optional", plist_new_bool(true));
+                        plist_dict_set_item(files, hash.first.c_str(), entry);
+                    }
+
+                    break;
+                }
+    }
+
+    for (const auto &version : versions) {
+        auto rules(plist_new_dict());
+        plist_dict_set_item(plist, ("rules" + version.first).c_str(), rules);
+
+        std::multiset<const Rule *, RuleCode> ordered;
+        for (const auto &rule : version.second)
+            ordered.insert(&rule);
+
+        for (const auto &rule : ordered)
+            if (rule->weight_ == 1 && rule->mode_ == NoMode)
+                plist_dict_set_item(rules, rule->code_.c_str(), plist_new_bool(true));
+            else {
+                auto entry(plist_new_dict());
+                plist_dict_set_item(rules, rule->code_.c_str(), entry);
+
+                switch (rule->mode_) {
+                    case NoMode:
+                        break;
+                    case OmitMode:
+                        plist_dict_set_item(entry, "omit", plist_new_bool(true));
+                        break;
+                    case OptionalMode:
+                        plist_dict_set_item(entry, "optional", plist_new_bool(true));
+                        break;
+                    case NestedMode:
+                        plist_dict_set_item(entry, "nested", plist_new_bool(true));
+                        break;
+                    case TopMode:
+                        plist_dict_set_item(entry, "top", plist_new_bool(true));
+                        break;
+                }
+
+                if (rule->weight_ >= 10000)
+                    plist_dict_set_item(entry, "weight", plist_new_uint(rule->weight_));
+                else if (rule->weight_ != 1)
+                    plist_dict_set_item(entry, "weight", plist_new_real(rule->weight_));
+            }
+    }
+
+    folder.Save(signature, fun([&](std::streambuf &save) {
+        HashProxy proxy(local[signature], save);
+        char *xml(NULL);
+        uint32_t size;
+        plist_to_xml(plist, &xml, &size);
+        _scope({ free(xml); });
+        put(proxy, xml, size);
+    }));
+
+    folder.Open(executable, fun([&](std::streambuf &buffer) {
+        // XXX: this is a miserable fail
+        std::stringbuf temp;
+        copy(buffer, temp);
+        auto data(temp.str());
+
+        folder.Save(executable, fun([&](std::streambuf &save) {
+            Slots slots;
+            slots[1] = local.at(info);
+            slots[3] = local.at(signature);
+
+            HashProxy proxy(local[executable], save);
+            Sign(data.data(), data.size(), proxy, identifier, entitlements, key, slots);
+        }));
+    }));
+
+    for (const auto &hash : local)
+        remote[root + hash.first] = hash.second;
+
+    return executable;
+}
+#endif
+
+#endif
+}
+
+#ifndef LDID_NOTOOLS
+int main(int argc, char *argv[]) {
+#ifndef LDID_NOSMIME
+    OpenSSL_add_all_algorithms();
+#endif
+
+    union {
+        uint16_t word;
+        uint8_t byte[2];
+    } endian = {1};
+
+    little_ = endian.byte[0];
+
+    bool flag_r(false);
     bool flag_e(false);
 
+#ifndef LDID_NOFLAGT
     bool flag_T(false);
+#endif
 
     bool flag_S(false);
     bool flag_s(false);
 
+    bool flag_D(false);
+
+    bool flag_A(false);
+    bool flag_a(false);
+
+    bool flag_u(false);
+
+    uint32_t flag_CPUType(_not(uint32_t));
+    uint32_t flag_CPUSubtype(_not(uint32_t));
+
+    const char *flag_I(NULL);
+
+#ifndef LDID_NOFLAGT
     bool timeh(false);
     uint32_t timev(0);
+#endif
 
-    const void *xmld(NULL);
-    size_t xmls(0);
-
-    uintptr_t noffset(_not(uintptr_t));
-    uintptr_t woffset(_not(uintptr_t));
+    Map entitlements;
+    Map key;
+    ldid::Slots slots;
 
     std::vector<std::string> files;
 
@@ -467,26 +2074,66 @@ int main(int argc, const char *argv[]) {
         if (argv[argi][0] != '-')
             files.push_back(argv[argi]);
         else switch (argv[argi][1]) {
-            case 'R': flag_R = true; break;
-            case 't': flag_t = true; break;
-            case 'u': flag_u = true; break;
-            case 'p': flag_p = true; break;
+            case 'r':
+                _assert(!flag_s);
+                _assert(!flag_S);
+                flag_r = true;
+            break;
+
             case 'e': flag_e = true; break;
 
+            case 'E': {
+                const char *slot = argv[argi] + 2;
+                const char *colon = strchr(slot, ':');
+                _assert(colon != NULL);
+                Map file(colon + 1, O_RDONLY, PROT_READ, MAP_PRIVATE);
+                char *arge;
+                unsigned number(strtoul(slot, &arge, 0));
+                _assert(arge == colon);
+                sha1(slots[number], file.data(), file.size());
+            } break;
+
+            case 'D': flag_D = true; break;
+
+            case 'a': flag_a = true; break;
+
+            case 'A':
+                _assert(!flag_A);
+                flag_A = true;
+                if (argv[argi][2] != '\0') {
+                    const char *cpu = argv[argi] + 2;
+                    const char *colon = strchr(cpu, ':');
+                    _assert(colon != NULL);
+                    char *arge;
+                    flag_CPUType = strtoul(cpu, &arge, 0);
+                    _assert(arge == colon);
+                    flag_CPUSubtype = strtoul(colon + 1, &arge, 0);
+                    _assert(arge == argv[argi] + strlen(argv[argi]));
+                }
+            break;
+
             case 's':
+                _assert(!flag_r);
                 _assert(!flag_S);
                 flag_s = true;
             break;
 
             case 'S':
+                _assert(!flag_r);
                 _assert(!flag_s);
                 flag_S = true;
                 if (argv[argi][2] != '\0') {
                     const char *xml = argv[argi] + 2;
-                    xmld = map(xml, 0, _not(size_t), &xmls, true);
+                    entitlements.open(xml, O_RDONLY, PROT_READ, MAP_PRIVATE);
                 }
             break;
 
+            case 'K':
+                if (argv[argi][2] != '\0')
+                    key.open(argv[argi] + 2, O_RDONLY, PROT_READ, MAP_PRIVATE);
+            break;
+
+#ifndef LDID_NOFLAGT
             case 'T': {
                 flag_T = true;
                 if (argv[argi][2] == '-')
@@ -497,17 +2144,14 @@ int main(int argc, const char *argv[]) {
                     _assert(arge == argv[argi] + strlen(argv[argi]));
                 }
             } break;
+#endif
 
-            case 'n': {
-                char *arge;
-                noffset = strtoul(argv[argi] + 2, &arge, 0);
-                _assert(arge == argv[argi] + strlen(argv[argi]));
+            case 'u': {
+                flag_u = true;
             } break;
 
-            case 'w': {
-                char *arge;
-                woffset = strtoul(argv[argi] + 2, &arge, 0);
-                _assert(arge == argv[argi] + strlen(argv[argi]));
+            case 'I': {
+                flag_I = argv[argi] + 2;
             } break;
 
             default:
@@ -515,310 +2159,159 @@ int main(int argc, const char *argv[]) {
             break;
         }
 
+    _assert(flag_S || key.empty());
+    _assert(flag_S || flag_I == NULL);
+
     if (files.empty()) usage: {
         exit(0);
     }
 
     size_t filei(0), filee(0);
     _foreach (file, files) try {
-        const char *path(file->c_str());
-        const char *base = strrchr(path, '/');
-        char *temp(NULL), *dir;
+        std::string path(file);
 
-        if (base != NULL)
-            dir = strndup_(path, base++ - path + 1);
-        else {
-            dir = strdup("");
-            base = path;
+        struct stat info;
+        _syscall(stat(path.c_str(), &info));
+
+        if (S_ISDIR(info.st_mode)) {
+#ifndef LDID_NOPLIST
+            _assert(!flag_r);
+            ldid::DiskFolder folder(path);
+            std::map<std::string, std::vector<char>> hashes;
+            path += "/" + Bundle("", folder, key, hashes, entitlements);
+#else
+            _assert(false);
+#endif
+        } else if (flag_S || flag_r) {
+            Map input(path, O_RDONLY, PROT_READ, MAP_PRIVATE);
+
+            std::filebuf output;
+            Split split(path);
+            auto temp(Temporary(output, split));
+
+            if (flag_r)
+                ldid::Unsign(input.data(), input.size(), output);
+            else {
+                std::string identifier(flag_I ?: split.base.c_str());
+                ldid::Sign(input.data(), input.size(), output, identifier, entitlements, key, slots);
+            }
+
+            Commit(path, temp);
         }
 
-        if (flag_S) {
-            asprintf(&temp, "%s.%s.cs", dir, base);
-            const char *allocate = getenv("CODESIGN_ALLOCATE");
-            if (allocate == NULL) {
-                string codesign_cmd = "arm-apple-darwin9-codesign_allocate";
-                string cmd_begin = "arm-apple";
-                string cmd_end = "codesign_allocate";
-                codesign_cmd = find_command(codesign_cmd, cmd_begin, cmd_end);
-                if(!codesign_cmd.empty())
-                    allocate = strdup(codesign_cmd.c_str());
-                else 
-                    allocate = "arm-apple-darwin9-codesign_allocate";
-            }
-            size_t size = _not(size_t);
-            const char *arch; {
-                Framework framework(path);
-                framework->flags |= MH_DYLDLINK;
+        bool modify(false);
+#ifndef LDID_NOFLAGT
+        if (flag_T)
+            modify = true;
+#endif
+        if (flag_s)
+            modify = true;
 
-                _foreach (load_command, framework.GetLoadCommands()) {
-                    uint32_t cmd(framework.Swap((*load_command)->cmd));
-                    if (cmd == LC_CODE_SIGNATURE) {
-                        struct linkedit_data_command *signature = reinterpret_cast<struct linkedit_data_command *>(*load_command);
-                        size = framework.Swap(signature->dataoff);
-                        _assert(size < framework.GetSize());
-                        break;
+        Map mapping(path, modify);
+        FatHeader fat_header(mapping.data(), mapping.size());
+
+        _foreach (mach_header, fat_header.GetMachHeaders()) {
+            struct linkedit_data_command *signature(NULL);
+            struct encryption_info_command *encryption(NULL);
+
+            if (flag_A) {
+                if (mach_header.GetCPUType() != flag_CPUType)
+                    continue;
+                if (mach_header.GetCPUSubtype() != flag_CPUSubtype)
+                    continue;
+            }
+
+            if (flag_a)
+                printf("cpu=0x%x:0x%x\n", mach_header.GetCPUType(), mach_header.GetCPUSubtype());
+
+            _foreach (load_command, mach_header.GetLoadCommands()) {
+                uint32_t cmd(mach_header.Swap(load_command->cmd));
+
+                if (false);
+                else if (cmd == LC_CODE_SIGNATURE)
+                    signature = reinterpret_cast<struct linkedit_data_command *>(load_command);
+                else if (cmd == LC_ENCRYPTION_INFO || cmd == LC_ENCRYPTION_INFO_64)
+                    encryption = reinterpret_cast<struct encryption_info_command *>(load_command);
+                else if (cmd == LC_LOAD_DYLIB) {
+                    volatile struct dylib_command *dylib_command(reinterpret_cast<struct dylib_command *>(load_command));
+                    const char *name(reinterpret_cast<const char *>(load_command) + mach_header.Swap(dylib_command->dylib.name));
+
+                    if (strcmp(name, "/System/Library/Frameworks/UIKit.framework/UIKit") == 0) {
+                        if (flag_u) {
+                            Version version;
+                            version.value = mach_header.Swap(dylib_command->dylib.current_version);
+                            printf("uikit=%u.%u.%u\n", version.major, version.minor, version.patch);
+                        }
                     }
                 }
+#ifndef LDID_NOFLAGT
+                else if (cmd == LC_ID_DYLIB) {
+                    volatile struct dylib_command *dylib_command(reinterpret_cast<struct dylib_command *>(load_command));
 
-                if (size == _not(size_t))
-                    size = framework.GetSize();
+                    if (flag_T) {
+                        uint32_t timed;
 
-                switch (framework->cputype) {
-                    case 12: switch (framework->cpusubtype) {
-                        case 0: arch = "arm"; break;
-                        case 6: arch = "armv6"; break;
-                        case 9: arch = "armv7"; break;
-                        case 11: arch = "armv7s"; break;
-                        default: arch = NULL; break;
-                    } break;
+                        if (!timeh)
+                            timed = timev;
+                        else {
+                            dylib_command->dylib.timestamp = 0;
+                            timed = hash(reinterpret_cast<uint8_t *>(mach_header.GetBase()), mach_header.GetSize(), timev);
+                        }
 
-                    default: arch = NULL; break;
-                }
-            }
-
-            _assert(arch != NULL);
-
-            pid_t pid = fork();
-            _syscall(pid);
-            if (pid == 0) {
-                char *ssize;
-                asprintf(&ssize, "%lu", (sizeof(struct SuperBlob) + 2 * sizeof(struct BlobIndex) + sizeof(struct CodeDirectory) + strlen(base) + 1 + ((xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS) + (size + 0x1000 - 1) / 0x1000) * 0x14 + 0xc + (xmld == NULL ? 0 : 0x10 + xmls) + 15) / 16 * 16);
-                //printf("%s -i %s -a %s %s -o %s\n", allocate, path, arch, ssize, temp);
-                execlp(allocate, allocate, "-i", path, "-a", arch, ssize, "-o", temp, NULL);
-                _assert(false);
-            }
-
-            int status;
-            _syscall(waitpid(pid, &status, 0));
-            _assert(WIFEXITED(status));
-            _assert(WEXITSTATUS(status) == 0);
-        }
-
-        Framework framework(temp == NULL ? path : temp);
-        struct linkedit_data_command *signature(NULL);
-
-        if (flag_p)
-            printf("path%zu='%s'\n", filei, file->c_str());
-
-        if (woffset != _not(uintptr_t)) {
-            Pointer<uint32_t> wvalue(framework.GetPointer<uint32_t>(woffset));
-            if (wvalue == NULL)
-                printf("(null) %lu\n", woffset);
-            else
-                printf("0x%.08x\n", *wvalue);
-        }
-
-        if (noffset != _not(uintptr_t))
-            printf("%s\n", &*framework.GetPointer<char>(noffset));
-
-        _foreach (load_command, framework.GetLoadCommands()) {
-            uint32_t cmd(framework.Swap((*load_command)->cmd));
-
-            if (flag_R && cmd == LC_REEXPORT_DYLIB)
-                (*load_command)->cmd = framework.Swap(LC_LOAD_DYLIB);
-            else if (cmd == LC_CODE_SIGNATURE)
-                signature = reinterpret_cast<struct linkedit_data_command *>(*load_command);
-            else if (cmd == LC_UUID) {
-                volatile struct uuid_command *uuid_command(reinterpret_cast<struct uuid_command *>(*load_command));
-
-                if (flag_u) {
-                    printf("uuid%zu=%.2x%.2x%.2x%.2x-%.2x%.2x-%.2x%.2x-%.2x%.2x-%.2x%.2x%.2x%.2x%.2x%.2x\n", filei,
-                        uuid_command->uuid[ 0], uuid_command->uuid[ 1], uuid_command->uuid[ 2], uuid_command->uuid[ 3],
-                        uuid_command->uuid[ 4], uuid_command->uuid[ 5], uuid_command->uuid[ 6], uuid_command->uuid[ 7],
-                        uuid_command->uuid[ 8], uuid_command->uuid[ 9], uuid_command->uuid[10], uuid_command->uuid[11],
-                        uuid_command->uuid[12], uuid_command->uuid[13], uuid_command->uuid[14], uuid_command->uuid[15]
-                    );
-                }
-            } else if (cmd == LC_ID_DYLIB) {
-                volatile struct dylib_command *dylib_command(reinterpret_cast<struct dylib_command *>(*load_command));
-
-                if (flag_t)
-                    printf("time%zu=0x%.8x\n", filei, framework.Swap(dylib_command->dylib.timestamp));
-
-                if (flag_T) {
-                    uint32_t timed;
-
-                    if (!timeh)
-                        timed = timev;
-                    else {
-                        dylib_command->dylib.timestamp = 0;
-                        timed = ::hash(reinterpret_cast<uint8_t *>(framework.GetBase()), framework.GetSize(), timev);
+                        dylib_command->dylib.timestamp = mach_header.Swap(timed);
                     }
-
-                    dylib_command->dylib.timestamp = framework.Swap(timed);
                 }
+#endif
+            }
+
+            if (flag_D) {
+                _assert(encryption != NULL);
+                encryption->cryptid = mach_header.Swap(0);
+            }
+
+            if (flag_e) {
+                _assert(signature != NULL);
+
+                uint32_t data = mach_header.Swap(signature->dataoff);
+
+                uint8_t *top = reinterpret_cast<uint8_t *>(mach_header.GetBase());
+                uint8_t *blob = top + data;
+                struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
+
+                for (size_t index(0); index != Swap(super->count); ++index)
+                    if (Swap(super->index[index].type) == CSSLOT_ENTITLEMENTS) {
+                        uint32_t begin = Swap(super->index[index].offset);
+                        struct Blob *entitlements = reinterpret_cast<struct Blob *>(blob + begin);
+                        fwrite(entitlements + 1, 1, Swap(entitlements->length) - sizeof(*entitlements), stdout);
+                    }
+            }
+
+            if (flag_s) {
+                _assert(signature != NULL);
+
+                uint32_t data = mach_header.Swap(signature->dataoff);
+
+                uint8_t *top = reinterpret_cast<uint8_t *>(mach_header.GetBase());
+                uint8_t *blob = top + data;
+                struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
+
+                for (size_t index(0); index != Swap(super->count); ++index)
+                    if (Swap(super->index[index].type) == CSSLOT_CODEDIRECTORY) {
+                        uint32_t begin = Swap(super->index[index].offset);
+                        struct CodeDirectory *directory = reinterpret_cast<struct CodeDirectory *>(blob + begin);
+
+                        uint8_t (*hashes)[LDID_SHA1_DIGEST_LENGTH] = reinterpret_cast<uint8_t (*)[LDID_SHA1_DIGEST_LENGTH]>(blob + begin + Swap(directory->hashOffset));
+                        uint32_t pages = Swap(directory->nCodeSlots);
+
+                        if (pages != 1)
+                            for (size_t i = 0; i != pages - 1; ++i)
+                                sha1(hashes[i], top + PageSize_ * i, PageSize_);
+                        if (pages != 0)
+                            sha1(hashes[pages - 1], top + PageSize_ * (pages - 1), ((data - 1) % PageSize_) + 1);
+                    }
             }
         }
 
-        if (flag_e) {
-            _assert(signature != NULL);
-
-            uint32_t data = framework.Swap(signature->dataoff);
-            uint32_t size = framework.Swap(signature->datasize);
-
-            uint8_t *top = reinterpret_cast<uint8_t *>(framework.GetBase());
-            uint8_t *blob = top + data;
-            struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
-
-            for (size_t index(0); index != Swap(super->count); ++index)
-                if (Swap(super->index[index].type) == CSSLOT_ENTITLEMENTS) {
-                    uint32_t begin = Swap(super->index[index].offset);
-                    struct Blob *entitlements = reinterpret_cast<struct Blob *>(blob + begin);
-                    fwrite(entitlements + 1, 1, Swap(entitlements->length) - sizeof(struct Blob), stdout);
-                }
-        }
-
-        if (flag_s) {
-            _assert(signature != NULL);
-
-            uint32_t data = framework.Swap(signature->dataoff);
-            uint32_t size = framework.Swap(signature->datasize);
-
-            uint8_t *top = reinterpret_cast<uint8_t *>(framework.GetBase());
-            uint8_t *blob = top + data;
-            struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
-
-            for (size_t index(0); index != Swap(super->count); ++index)
-                if (Swap(super->index[index].type) == CSSLOT_CODEDIRECTORY) {
-                    uint32_t begin = Swap(super->index[index].offset);
-                    struct CodeDirectory *directory = reinterpret_cast<struct CodeDirectory *>(blob + begin);
-
-                    uint8_t (*hashes)[20] = reinterpret_cast<uint8_t (*)[20]>(blob + begin + Swap(directory->hashOffset));
-                    uint32_t pages = Swap(directory->nCodeSlots);
-
-                    if (pages != 1)
-                        for (size_t i = 0; i != pages - 1; ++i)
-                            sha1(hashes[i], top + 0x1000 * i, 0x1000);
-                    if (pages != 0)
-                        sha1(hashes[pages - 1], top + 0x1000 * (pages - 1), ((data - 1) % 0x1000) + 1);
-                }
-        }
-
-        if (flag_S) {
-            _assert(signature != NULL);
-
-            uint32_t data = framework.Swap(signature->dataoff);
-            uint32_t size = framework.Swap(signature->datasize);
-
-            uint8_t *top = reinterpret_cast<uint8_t *>(framework.GetBase());
-            uint8_t *blob = top + data;
-            struct SuperBlob *super = reinterpret_cast<struct SuperBlob *>(blob);
-            super->blob.magic = Swap(CSMAGIC_EMBEDDED_SIGNATURE);
-
-            uint32_t count = xmld == NULL ? 2 : 3;
-            uint32_t offset = sizeof(struct SuperBlob) + count * sizeof(struct BlobIndex);
-
-            super->index[0].type = Swap(CSSLOT_CODEDIRECTORY);
-            super->index[0].offset = Swap(offset);
-
-            uint32_t begin = offset;
-            struct CodeDirectory *directory = reinterpret_cast<struct CodeDirectory *>(blob + begin);
-            offset += sizeof(struct CodeDirectory);
-
-            directory->blob.magic = Swap(CSMAGIC_CODEDIRECTORY);
-            directory->version = Swap(0x00020001);
-            directory->flags = Swap(0);
-            directory->codeLimit = Swap(data);
-            directory->hashSize = 0x14;
-            directory->hashType = 0x01;
-            directory->spare1 = 0x00;
-            directory->pageSize = 0x0c;
-            directory->spare2 = Swap(0);
-
-            directory->identOffset = Swap(offset - begin);
-            strcpy(reinterpret_cast<char *>(blob + offset), base);
-            offset += strlen(base) + 1;
-
-            uint32_t special = xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS;
-            directory->nSpecialSlots = Swap(special);
-
-            uint8_t (*hashes)[20] = reinterpret_cast<uint8_t (*)[20]>(blob + offset);
-            memset(hashes, 0, sizeof(*hashes) * special);
-
-            offset += sizeof(*hashes) * special;
-            hashes += special;
-
-            uint32_t pages = (data + 0x1000 - 1) / 0x1000;
-            directory->nCodeSlots = Swap(pages);
-
-            if (pages != 1)
-                for (size_t i = 0; i != pages - 1; ++i)
-                    sha1(hashes[i], top + 0x1000 * i, 0x1000);
-            if (pages != 0)
-                sha1(hashes[pages - 1], top + 0x1000 * (pages - 1), ((data - 1) % 0x1000) + 1);
-
-            directory->hashOffset = Swap(offset - begin);
-            offset += sizeof(*hashes) * pages;
-            directory->blob.length = Swap(offset - begin);
-
-            super->index[1].type = Swap(CSSLOT_REQUIREMENTS);
-            super->index[1].offset = Swap(offset);
-
-            memcpy(blob + offset, "\xfa\xde\x0c\x01\x00\x00\x00\x0c\x00\x00\x00\x00", 0xc);
-            offset += 0xc;
-
-            if (xmld != NULL) {
-                super->index[2].type = Swap(CSSLOT_ENTITLEMENTS);
-                super->index[2].offset = Swap(offset);
-
-                uint32_t begin = offset;
-                struct Blob *entitlements = reinterpret_cast<struct Blob *>(blob + begin);
-                offset += sizeof(struct Blob);
-
-                memcpy(blob + offset, xmld, xmls);
-                offset += xmls;
-
-                entitlements->magic = Swap(CSMAGIC_ENTITLEMENTS);
-                entitlements->length = Swap(offset - begin);
-            }
-
-            for (size_t index(0); index != count; ++index) {
-                uint32_t type = Swap(super->index[index].type);
-                if (type != 0 && type <= special) {
-                    uint32_t offset = Swap(super->index[index].offset);
-                    struct Blob *local = (struct Blob *) (blob + offset);
-                    sha1((uint8_t *) (hashes - type), (uint8_t *) local, Swap(local->length));
-                }
-            }
-
-            super->count = Swap(count);
-            super->blob.length = Swap(offset);
-
-            if (offset > size) {
-                fprintf(stderr, "offset (%u) > size (%u)\n", offset, size);
-                _assert(false);
-            } //else fprintf(stderr, "offset (%zu) <= size (%zu)\n", offset, size);
-
-            memset(blob + offset, 0, size - offset);
-        }
-
-        if (flag_S) {
-            uint8_t *top = reinterpret_cast<uint8_t *>(framework.GetBase());
-            size_t size = framework.GetSize();
-
-            char *copy;
-            asprintf(&copy, "%s.%s.cp", dir, base);
-            FILE *file = fopen(copy, "w+");
-            size_t writ = fwrite(top, 1, size, file);
-            _assert(writ == size);
-            fclose(file);
-
-            _syscall(unlink(temp));
-            free(temp);
-            temp = copy;
-        }
-
-        if (temp) {
-            struct stat info;
-            _syscall(stat(path, &info));
-            _syscall(chown(temp, info.st_uid, info.st_gid));
-            _syscall(chmod(temp, info.st_mode));
-            _syscall(unlink(path));
-            _syscall(rename(temp, path));
-            free(temp);
-        }
-
-        free(dir);
         ++filei;
     } catch (const char *) {
         ++filee;
@@ -827,3 +2320,4 @@ int main(int argc, const char *argv[]) {
 
     return filee;
 }
+#endif
