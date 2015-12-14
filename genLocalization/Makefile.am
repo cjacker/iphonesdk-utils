@@ -22,11 +22,11 @@ CLANG_LIBS = \
 ios_genLocalization_CPPFLAGS =	\
 	$(LLVM_CXX_FLAGS)	\
 	-I$(top_srcdir)/libhelper	\
-	-I$(top_srcdir)/libplutil	\
+        $(PLIST_CFLAGS) \
 	-fno-rtti
 
 ios_genLocalization_LDADD =	\
-       	$(top_builddir)/libplutil/libplutil.la	\
+        $(PLIST_LIBS) \
       	$(top_builddir)/libhelper/libhelper.la	\
        	$(CLANG_LIBS)	\
 	$(LLVM_LIBS)

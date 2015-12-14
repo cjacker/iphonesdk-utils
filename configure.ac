@@ -99,13 +99,12 @@ AC_SUBST(TEMPLATES_DIR)
 AC_OUTPUT([
 	   Makefile
 	   libhelper/Makefile
-	   libplutil/Makefile
 	   ldid/Makefile
 	   clangwrapper/Makefile
 	   plutil/Makefile
 	   createProject/Makefile
 	   createProject/templates/Makefile
-	   genLocalization2/Makefile
+	   genLocalization/Makefile
 	   pngcrush/Makefile
 	   xcbuild/Makefile
 ])

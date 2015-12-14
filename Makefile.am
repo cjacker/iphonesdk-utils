@@ -1,4 +1,4 @@
-SUBDIRS = libplutil libhelper ldid clangwrapper genLocalization2 createProject plutil pngcrush xcbuild 
+SUBDIRS = libhelper ldid clangwrapper genLocalization createProject plutil pngcrush xcbuild 
 
 #EXTRA_DIST =
 #DISTCLEANFILES =
