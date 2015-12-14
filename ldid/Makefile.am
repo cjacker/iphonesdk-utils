@@ -9,4 +9,4 @@ noinst_LTLIBRARIES  = liblookup2.la
 liblookup2_la_SOURCES  = lookup2.c
 liblookup2_la_CFLAGS = -I$(top_srcdir)/libhelper $(CRYPTO_CFLAGS) 
 
-EXTRA_DIST = sha1.h
+EXTRA_DIST = sha1.h ldid.hpp
