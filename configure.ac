@@ -57,6 +57,11 @@ PKG_CHECK_MODULES(XML, [
     libxml-2.0 
 ])
 
+PKG_CHECK_MODULES(CRYPTO, [
+    libcrypto 
+])
+
+
 AC_CHECK_PROG(HAVE_LLVM_CONFIG, llvm-config, true, false)
 
 if test "x$HAVE_LLVM_CONFIG" = "xfalse"; then
